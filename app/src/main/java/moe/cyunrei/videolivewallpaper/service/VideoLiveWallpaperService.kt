@@ -13,66 +13,132 @@ class VideoLiveWallpaperService : WallpaperService() {
         private var mediaPlayer: MediaPlayer? = null
         private var broadcastReceiver: BroadcastReceiver? = null
         private var videoFilePath: String? = null
+        private var prepared = false
+        private var surfaceReady = false
+        private var landscape = false
+        private var visibleNow = false
 
         override fun onCreate(surfaceHolder: SurfaceHolder) {
             super.onCreate(surfaceHolder)
-            videoFilePath =
+            videoFilePath = try {
                 this@VideoLiveWallpaperService.openFileInput("video_live_wallpaper_file_path")
                     .bufferedReader().readText()
+            } catch (e: Exception) {
+                null
+            }
             val intentFilter = IntentFilter(VIDEO_PARAMS_CONTROL_ACTION)
             registerReceiver(object : BroadcastReceiver() {
                 override fun onReceive(context: Context, intent: Intent) {
-                    val action = intent.getBooleanExtra(KEY_ACTION, false)
-                    if (action) {
-                        mediaPlayer!!.setVolume(0f, 0f)
-                    } else {
-                        mediaPlayer!!.setVolume(1.0f, 1.0f)
-                    }
+                    val mute = intent.getBooleanExtra(KEY_ACTION, false)
+                    setVolumeSafe(!mute)
                 }
             }.also { broadcastReceiver = it }, intentFilter)
+            // Player is created and prepared ONCE, in the background, and kept alive.
+            initPlayer()
         }
 
-        override fun onSurfaceCreated(holder: SurfaceHolder) {
-            super.onSurfaceCreated(holder)
-            mediaPlayer = MediaPlayer().apply {
-                setSurface(holder.surface)
-                setDataSource(videoFilePath)
-                isLooping = true
-                setVideoScalingMode(MediaPlayer.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING)
-                prepare()
-                start()
-            }
+        private fun setVolumeSafe(on: Boolean) {
             try {
-                val file = File("$filesDir/unmute")
-                if (file.exists()) mediaPlayer!!.setVolume(1.0f, 1.0f) else mediaPlayer!!.setVolume(
-                    0f,
-                    0f
-                )
-            } catch (e: IOException) {
+                val v = if (on) 1.0f else 0f
+                mediaPlayer?.setVolume(v, v)
+            } catch (e: IllegalStateException) {
                 e.printStackTrace()
             }
         }
 
-        override fun onVisibilityChanged(visible: Boolean) {
-            if (visible) {
-                mediaPlayer!!.start()
-            } else {
-                mediaPlayer!!.pause()
+        private fun initPlayer() {
+            val path = videoFilePath ?: return
+            try {
+                mediaPlayer = MediaPlayer().apply {
+                    setDataSource(path)
+                    isLooping = true
+                    setOnPreparedListener {
+                        prepared = true
+                        attachSurface()
+                        updatePlayback()
+                    }
+                    setOnErrorListener { _, _, _ ->
+                        prepared = false
+                        true
+                    }
+                    prepareAsync()
+                }
+                setVolumeSafe(File("$filesDir/unmute").exists())
+            } catch (e: Exception) {
+                e.printStackTrace()
+                mediaPlayer?.release()
+                mediaPlayer = null
             }
+        }
+
+        private fun attachSurface() {
+            val mp = mediaPlayer ?: return
+            if (!surfaceReady || !prepared) return
+            try {
+                mp.setSurface(surfaceHolder.surface)
+                mp.setVideoScalingMode(MediaPlayer.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING)
+                // Paused? Seek to the current spot so the frame is drawn on the new surface.
+                if (!mp.isPlaying) mp.seekTo(mp.currentPosition)
+            } catch (e: IllegalStateException) {
+                e.printStackTrace()
+            }
+        }
+
+        private fun updatePlayback() {
+            val mp = mediaPlayer ?: return
+            if (!prepared) return
+            try {
+                if (visibleNow && surfaceReady && !landscape) {
+                    if (!mp.isPlaying) mp.start()
+                } else if (mp.isPlaying) {
+                    mp.pause()
+                }
+            } catch (e: IllegalStateException) {
+                e.printStackTrace()
+            }
+        }
+
+        override fun onSurfaceCreated(holder: SurfaceHolder) {
+            super.onSurfaceCreated(holder)
+            surfaceReady = true
+            attachSurface()
+            updatePlayback()
+        }
+
+        override fun onSurfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+            super.onSurfaceChanged(holder, format, width, height)
+            // Landscape = freeze the wallpaper (pause), resume when back in portrait.
+            landscape = width > height
+            updatePlayback()
+        }
+
+        override fun onVisibilityChanged(visible: Boolean) {
+            visibleNow = visible
+            updatePlayback()
         }
 
         override fun onSurfaceDestroyed(holder: SurfaceHolder) {
             super.onSurfaceDestroyed(holder)
-            if (mediaPlayer!!.isPlaying) mediaPlayer!!.stop()
-            mediaPlayer?.release()
-            mediaPlayer = null
+            surfaceReady = false
+            // Do NOT release the player: keep it prepared so resume is instant.
+            try {
+                mediaPlayer?.let { if (it.isPlaying) it.pause() }
+                mediaPlayer?.setSurface(null)
+            } catch (e: IllegalStateException) {
+                e.printStackTrace()
+            }
         }
 
         override fun onDestroy() {
             super.onDestroy()
+            prepared = false
             mediaPlayer?.release()
             mediaPlayer = null
-            unregisterReceiver(broadcastReceiver)
+            try {
+                unregisterReceiver(broadcastReceiver)
+            } catch (e: IllegalArgumentException) {
+                e.printStackTrace()
+            }
         }
     }
 
