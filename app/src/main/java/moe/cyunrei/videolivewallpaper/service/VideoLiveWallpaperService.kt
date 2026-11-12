@@ -2,8 +2,10 @@ package moe.cyunrei.videolivewallpaper.service
 
 import android.app.WallpaperManager
 import android.content.*
-import android.graphics.Color
 import android.media.MediaPlayer
+import android.opengl.EGL14
+import android.opengl.EGLConfig
+import android.opengl.GLES20
 import android.os.Handler
 import android.os.Looper
 import android.service.wallpaper.WallpaperService
@@ -20,6 +22,7 @@ class VideoLiveWallpaperService : WallpaperService() {
         private var surfaceReady = false
         private var attached = false
         private var landscape = false
+        private var blackDrawn = false
         private var visibleNow = false
         private val handler = Handler(Looper.getMainLooper())
 
@@ -85,6 +88,7 @@ class VideoLiveWallpaperService : WallpaperService() {
                 mp.setVideoScalingMode(MediaPlayer.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING)
                 if (!mp.isPlaying) mp.seekTo(mp.currentPosition)
                 attached = true
+                blackDrawn = false
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -102,15 +106,51 @@ class VideoLiveWallpaperService : WallpaperService() {
             attached = false
         }
 
-        // Landscape = plain black screen. Portrait = video.
+        // Landscape = plain black screen. Drawn with EGL (not lockCanvas), because lockCanvas
+        // leaves the surface locked to the CPU and the video could never attach again.
         private fun drawBlack() {
-            if (!landscape || !surfaceReady || attached) return
+            if (!landscape || !surfaceReady || attached || blackDrawn) return
             try {
-                val holder = surfaceHolder
-                val canvas = holder.lockCanvas()
-                if (canvas != null) {
-                    canvas.drawColor(Color.BLACK)
-                    holder.unlockCanvasAndPost(canvas)
+                val display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+                val ver = IntArray(2)
+                if (!EGL14.eglInitialize(display, ver, 0, ver, 1)) return
+                val attribs = intArrayOf(
+                    EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                    EGL14.EGL_RED_SIZE, 8,
+                    EGL14.EGL_GREEN_SIZE, 8,
+                    EGL14.EGL_BLUE_SIZE, 8,
+                    EGL14.EGL_NONE
+                )
+                val configs = arrayOfNulls<EGLConfig>(1)
+                val num = IntArray(1)
+                if (!EGL14.eglChooseConfig(display, attribs, 0, configs, 0, 1, num, 0) ||
+                    num[0] <= 0
+                ) return
+                val ctx = EGL14.eglCreateContext(
+                    display, configs[0], EGL14.EGL_NO_CONTEXT,
+                    intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0
+                )
+                val win = EGL14.eglCreateWindowSurface(
+                    display, configs[0], surfaceHolder.surface,
+                    intArrayOf(EGL14.EGL_NONE), 0
+                )
+                if (win == null || win == EGL14.EGL_NO_SURFACE) {
+                    EGL14.eglDestroyContext(display, ctx)
+                    return
+                }
+                try {
+                    if (EGL14.eglMakeCurrent(display, win, win, ctx)) {
+                        GLES20.glClearColor(0f, 0f, 0f, 1f)
+                        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+                        EGL14.eglSwapBuffers(display, win)
+                        blackDrawn = true
+                    }
+                } finally {
+                    EGL14.eglMakeCurrent(
+                        display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT
+                    )
+                    EGL14.eglDestroySurface(display, win)
+                    EGL14.eglDestroyContext(display, ctx)
                 }
             } catch (t: Throwable) {
                 t.printStackTrace()
@@ -146,6 +186,7 @@ class VideoLiveWallpaperService : WallpaperService() {
         override fun onSurfaceCreated(holder: SurfaceHolder) {
             super.onSurfaceCreated(holder)
             surfaceReady = true
+            blackDrawn = false
             syncSurface()
             updatePlayback()
         }
