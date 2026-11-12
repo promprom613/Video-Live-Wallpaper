@@ -2,11 +2,7 @@ package moe.cyunrei.videolivewallpaper.service
 
 import android.app.WallpaperManager
 import android.content.*
-import android.graphics.Bitmap
 import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.Rect
-import android.media.MediaMetadataRetriever
 import android.media.MediaPlayer
 import android.os.Handler
 import android.os.Looper
@@ -25,15 +21,7 @@ class VideoLiveWallpaperService : WallpaperService() {
         private var attached = false
         private var landscape = false
         private var visibleNow = false
-        private var portraitW = 0
-        private var portraitH = 0
-        private var surfW = 0
-        private var surfH = 0
-        private var frozen: Bitmap? = null
-        private var capturing = false
-        private var frameGen = 0
         private val handler = Handler(Looper.getMainLooper())
-        private val paint = Paint(Paint.FILTER_BITMAP_FLAG)
 
         override fun onCreate(surfaceHolder: SurfaceHolder) {
             super.onCreate(surfaceHolder)
@@ -57,7 +45,7 @@ class VideoLiveWallpaperService : WallpaperService() {
             try {
                 val v = if (on) 1.0f else 0f
                 mediaPlayer?.setVolume(v, v)
-            } catch (e: IllegalStateException) {
+            } catch (e: Exception) {
                 e.printStackTrace()
             }
         }
@@ -82,7 +70,10 @@ class VideoLiveWallpaperService : WallpaperService() {
                 setVolumeSafe(File("$filesDir/unmute").exists())
             } catch (e: Exception) {
                 e.printStackTrace()
-                mediaPlayer?.release()
+                try {
+                    mediaPlayer?.release()
+                } catch (e2: Exception) {
+                }
                 mediaPlayer = null
             }
         }
@@ -94,7 +85,7 @@ class VideoLiveWallpaperService : WallpaperService() {
                 mp.setVideoScalingMode(MediaPlayer.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING)
                 if (!mp.isPlaying) mp.seekTo(mp.currentPosition)
                 attached = true
-            } catch (e: IllegalStateException) {
+            } catch (e: Exception) {
                 e.printStackTrace()
             }
         }
@@ -105,23 +96,36 @@ class VideoLiveWallpaperService : WallpaperService() {
                     if (it.isPlaying) it.pause()
                     it.setSurface(null)
                 }
-            } catch (e: IllegalStateException) {
+            } catch (e: Exception) {
                 e.printStackTrace()
             }
             attached = false
         }
 
-        // Portrait: video plays on the surface. Landscape: video is detached and a still
-        // frame is drawn with the exact portrait framing (no stretch, no zoom, no rotation).
+        // Landscape = plain black screen. Portrait = video.
+        private fun drawBlack() {
+            if (!landscape || !surfaceReady || attached) return
+            try {
+                val holder = surfaceHolder
+                val canvas = holder.lockCanvas()
+                if (canvas != null) {
+                    canvas.drawColor(Color.BLACK)
+                    holder.unlockCanvasAndPost(canvas)
+                }
+            } catch (t: Throwable) {
+                t.printStackTrace()
+            }
+        }
+
         private fun syncSurface() {
-            if (!prepared) return
-            if (surfaceReady && !landscape) {
-                if (!attached) attachSurface()
-                releaseFrozen()
-            } else {
-                if (landscape && surfaceReady && frozen == null && !capturing) startCapture()
+            if (landscape && surfaceReady) {
                 if (attached) detachSurface()
-                drawFrozen()
+                drawBlack()
+                // retry shortly in case the player had not released the surface yet
+                handler.postDelayed({ drawBlack() }, 150)
+                handler.postDelayed({ drawBlack() }, 600)
+            } else if (surfaceReady && prepared && !attached) {
+                attachSurface()
             }
         }
 
@@ -134,99 +138,8 @@ class VideoLiveWallpaperService : WallpaperService() {
                 } else if (mp.isPlaying) {
                     mp.pause()
                 }
-            } catch (e: IllegalStateException) {
-                e.printStackTrace()
-            }
-        }
-
-        private fun releaseFrozen() {
-            frameGen++
-            capturing = false
-            frozen?.recycle()
-            frozen = null
-        }
-
-        private fun startCapture() {
-            val path = videoFilePath ?: return
-            val pos = try {
-                mediaPlayer?.currentPosition ?: 0
-            } catch (e: IllegalStateException) {
-                0
-            }
-            capturing = true
-            val gen = ++frameGen
-            Thread {
-                var bmp: Bitmap? = null
-                val r = MediaMetadataRetriever()
-                try {
-                    r.setDataSource(path)
-                    bmp = r.getFrameAtTime(
-                        pos * 1000L,
-                        MediaMetadataRetriever.OPTION_CLOSEST
-                    )
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                } finally {
-                    try {
-                        r.release()
-                    } catch (e: Exception) {
-                    }
-                }
-                handler.post {
-                    if (gen == frameGen && landscape && surfaceReady) {
-                        capturing = false
-                        frozen = bmp
-                        drawFrozen()
-                    } else {
-                        bmp?.recycle()
-                    }
-                }
-            }.start()
-        }
-
-        private fun drawFrozen() {
-            if (!landscape || !surfaceReady || surfW == 0 || surfH == 0) return
-            val holder = surfaceHolder
-            var canvas: android.graphics.Canvas? = null
-            try {
-                canvas = holder.lockCanvas() ?: return
-                canvas.drawColor(Color.BLACK)
-                val bmp = frozen
-                if (bmp != null && !bmp.isRecycled) {
-                    val pw = if (portraitW > 0) portraitW else minOf(surfW, surfH)
-                    val ph = if (portraitH > 0) portraitH else maxOf(surfW, surfH)
-                    val a = pw.toFloat() / ph.toFloat()
-                    // source: center-crop of the frame to the portrait screen aspect
-                    val bw = bmp.width.toFloat()
-                    val bh = bmp.height.toFloat()
-                    val srcW: Float
-                    val srcH: Float
-                    if (bw / bh > a) {
-                        srcH = bh; srcW = bh * a
-                    } else {
-                        srcW = bw; srcH = bw / a
-                    }
-                    val sl = ((bw - srcW) / 2f).toInt()
-                    val st = ((bh - srcH) / 2f).toInt()
-                    val src = Rect(sl, st, sl + srcW.toInt(), st + srcH.toInt())
-                    // destination: same portrait picture, centered, full height
-                    var dh = canvas.height.toFloat()
-                    var dw = dh * a
-                    if (dw > canvas.width) {
-                        dw = canvas.width.toFloat(); dh = dw / a
-                    }
-                    val dl = ((canvas.width - dw) / 2f).toInt()
-                    val dt = ((canvas.height - dh) / 2f).toInt()
-                    val dst = Rect(dl, dt, dl + dw.toInt(), dt + dh.toInt())
-                    canvas.drawBitmap(bmp, src, dst, paint)
-                }
             } catch (e: Exception) {
                 e.printStackTrace()
-            } finally {
-                try {
-                    if (canvas != null) holder.unlockCanvasAndPost(canvas)
-                } catch (e: Exception) {
-                }
             }
         }
 
@@ -239,20 +152,14 @@ class VideoLiveWallpaperService : WallpaperService() {
 
         override fun onSurfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
             super.onSurfaceChanged(holder, format, width, height)
-            surfW = width
-            surfH = height
             landscape = width > height
-            if (!landscape) {
-                portraitW = width
-                portraitH = height
-            }
             syncSurface()
             updatePlayback()
         }
 
         override fun onSurfaceRedrawNeeded(holder: SurfaceHolder) {
             super.onSurfaceRedrawNeeded(holder)
-            drawFrozen()
+            drawBlack()
         }
 
         override fun onVisibilityChanged(visible: Boolean) {
@@ -263,6 +170,7 @@ class VideoLiveWallpaperService : WallpaperService() {
         override fun onSurfaceDestroyed(holder: SurfaceHolder) {
             super.onSurfaceDestroyed(holder)
             surfaceReady = false
+            handler.removeCallbacksAndMessages(null)
             // Keep the player prepared (no release) so resume is instant.
             if (attached) detachSurface()
         }
@@ -270,12 +178,15 @@ class VideoLiveWallpaperService : WallpaperService() {
         override fun onDestroy() {
             super.onDestroy()
             prepared = false
-            releaseFrozen()
-            mediaPlayer?.release()
+            handler.removeCallbacksAndMessages(null)
+            try {
+                mediaPlayer?.release()
+            } catch (e: Exception) {
+            }
             mediaPlayer = null
             try {
                 unregisterReceiver(broadcastReceiver)
-            } catch (e: IllegalArgumentException) {
+            } catch (e: Exception) {
                 e.printStackTrace()
             }
         }
