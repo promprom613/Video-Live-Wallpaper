@@ -3,11 +3,11 @@ package moe.cyunrei.videolivewallpaper.broadcast
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import moe.cyunrei.videolivewallpaper.service.VideoLiveWallpaperService
 
+// Nothing to start here: the system restarts the live wallpaper by itself after boot.
+// The wallpaper service now retries loading the video until storage is ready.
 internal class BootBroadCast : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        val service = Intent(context, VideoLiveWallpaperService::class.java)
-        context.startService(service)
+        // intentionally empty (the old startService call could crash on boot)
     }
 }

@@ -25,22 +25,52 @@ class VideoLiveWallpaperService : WallpaperService() {
         private var blackDrawn = false
         private var visibleNow = false
         private val handler = Handler(Looper.getMainLooper())
+        private val blackRetry = Runnable { drawBlack() }
+        private var loadTries = 0
+        private val loadRetry = object : Runnable {
+            override fun run() {
+                ensurePlayer()
+                if (mediaPlayer == null && loadTries < 60) {
+                    handler.postDelayed(this, 3000)
+                }
+            }
+        }
 
         override fun onCreate(surfaceHolder: SurfaceHolder) {
             super.onCreate(surfaceHolder)
+            val intentFilter = IntentFilter(VIDEO_PARAMS_CONTROL_ACTION)
+            intentFilter.addAction(Intent.ACTION_USER_PRESENT)
+            intentFilter.addAction("android.intent.action.USER_UNLOCKED")
+            registerReceiver(object : BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) {
+                    if (intent.action == VIDEO_PARAMS_CONTROL_ACTION) {
+                        val mute = intent.getBooleanExtra(KEY_ACTION, false)
+                        setVolumeSafe(!mute)
+                    } else {
+                        // device unlocked / storage ready: load the video if it is not loaded yet
+                        ensurePlayer()
+                    }
+                }
+            }.also { broadcastReceiver = it }, intentFilter)
+            ensurePlayer()
+            if (mediaPlayer == null) handler.postDelayed(loadRetry, 3000)
+        }
+
+        // Safe to call any time: loads the video only if there is no working player yet.
+        private fun ensurePlayer() {
+            if (mediaPlayer != null) return
+            loadTries++
             videoFilePath = try {
                 this@VideoLiveWallpaperService.openFileInput("video_live_wallpaper_file_path")
                     .bufferedReader().readText()
             } catch (e: Exception) {
                 null
             }
-            val intentFilter = IntentFilter(VIDEO_PARAMS_CONTROL_ACTION)
-            registerReceiver(object : BroadcastReceiver() {
-                override fun onReceive(context: Context, intent: Intent) {
-                    val mute = intent.getBooleanExtra(KEY_ACTION, false)
-                    setVolumeSafe(!mute)
-                }
-            }.also { broadcastReceiver = it }, intentFilter)
+            val path = videoFilePath
+            if (path.isNullOrEmpty() || !File(path).exists()) {
+                videoFilePath = null
+                return
+            }
             initPlayer()
         }
 
@@ -66,6 +96,15 @@ class VideoLiveWallpaperService : WallpaperService() {
                     }
                     setOnErrorListener { _, _, _ ->
                         prepared = false
+                        attached = false
+                        handler.post {
+                            try {
+                                mediaPlayer?.release()
+                            } catch (e: Exception) {
+                            }
+                            mediaPlayer = null
+                            handler.postDelayed(loadRetry, 3000)
+                        }
                         true
                     }
                     prepareAsync()
@@ -162,8 +201,9 @@ class VideoLiveWallpaperService : WallpaperService() {
                 if (attached) detachSurface()
                 drawBlack()
                 // retry shortly in case the player had not released the surface yet
-                handler.postDelayed({ drawBlack() }, 150)
-                handler.postDelayed({ drawBlack() }, 600)
+                handler.removeCallbacks(blackRetry)
+                handler.postDelayed(blackRetry, 150)
+                handler.postDelayed(blackRetry, 600)
             } else if (surfaceReady && prepared && !attached) {
                 attachSurface()
             }
@@ -205,13 +245,14 @@ class VideoLiveWallpaperService : WallpaperService() {
 
         override fun onVisibilityChanged(visible: Boolean) {
             visibleNow = visible
+            if (visible && mediaPlayer == null) ensurePlayer()
             updatePlayback()
         }
 
         override fun onSurfaceDestroyed(holder: SurfaceHolder) {
             super.onSurfaceDestroyed(holder)
             surfaceReady = false
-            handler.removeCallbacksAndMessages(null)
+            handler.removeCallbacks(blackRetry)
             // Keep the player prepared (no release) so resume is instant.
             if (attached) detachSurface()
         }
